@@ -1,0 +1,20 @@
+{
+  "name": "@pipeworx/mcp-datos-co",
+  "version": "0.1.0",
+  "description": "datos.gov.co — Colombia's national open-data portal (Socrata platform).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "datos-co"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pipeworx-io/mcp-datos-co"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
