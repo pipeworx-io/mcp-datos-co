@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-datos-co",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "datos.gov.co — Colombia's national open-data portal (Socrata platform).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-8e0e7f1a982ff0f326b1bfe4ebfbf3e07a462c73572624a370d298dc0ec3e937",
-    "sourceCommit": "29fb434ca65fe0f61191f19c3502f583f5fb99d7"
+    "sourceHash": "v1-2a58a08b5734b73a281bde2bce1f78edd9fb9d334a00b54712c12430cf600f78",
+    "sourceCommit": "ba9dd6df5992aeb16ef2425ee86d1752c34ca636"
   }
 }

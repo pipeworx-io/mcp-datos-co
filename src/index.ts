@@ -944,6 +944,10 @@ async function parseJsonBounded<T>(
  *   1. search_datasets(q)        -> find datasets + their Socrata 4x4 ids (e.g. "gt2j-8ykr")
  *   2. dataset_columns(datasetId)-> learn field names/types to $select/$where on
  *   3. query_dataset(datasetId)  -> pull rows with SoQL ($select/$where/$order/$group/$q)
+ *
+ * Collective investment funds (FIC): co_fic_search / co_fic_unit_value look a fund up by
+ * name (accent/case/word-order forgiving) and return its unit values and returns.
+ * Proxied per request; daily regulator data, so the gateway's default cache is fine.
  */
 
 
@@ -1014,6 +1018,45 @@ const tools: McpToolExport['tools'] = [
       required: ['datasetId'],
     },
   },
+  {
+    name: 'co_fic_search',
+    description:
+      'Find a Colombian collective investment fund (fondo de inversión colectiva, FIC) by name. Accepts the ' +
+      'fund or the fiduciaria / management company in any case, with or without accents, in any word order ' +
+      '(e.g. "Fiducoldex Capital Inteligente", "fondo abierto bancolombia"). Returns ranked candidates with ' +
+      'entity, fund name and fund_code, or found:false with the closest fund names when nothing matches. ' +
+      'Source: Superintendencia Financiera de Colombia.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Fund name, or fund manager name, e.g. "Fiducoldex Capital Inteligente".' },
+        limit: { type: 'number', description: 'Max candidates to return (default 10, max 25).' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'co_fic_unit_value',
+    description:
+      'Unit value (valor de la unidad) and returns (rentabilidad diaria/mensual/semestral/anual) for a Colombian ' +
+      'collective investment fund (FIC), per participation class, with fund size and number of investors. Give ' +
+      'the fund by name (forgiving match) or by fund_code from co_fic_search. Default is the latest published day; ' +
+      'pass date (YYYY-MM-DD) for one day or from/to for a history. An unknown fund returns found:false with ' +
+      'close fund names; an ambiguous name returns the candidates to choose from. Source: Superintendencia ' +
+      'Financiera de Colombia, FIC daily series.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fund: { type: 'string', description: 'Fund name, e.g. "Fiducoldex Capital Inteligente". Optional if fund_code is given.' },
+        fund_code: { type: 'number', description: 'Fund code from co_fic_search (exact; skips name matching).' },
+        date: { type: 'string', description: 'One day, YYYY-MM-DD (the regulator publishes with a few days lag).' },
+        from: { type: 'string', description: 'History start, YYYY-MM-DD.' },
+        to: { type: 'string', description: 'History end, YYYY-MM-DD (default latest).' },
+        participation_class: { type: 'number', description: 'Only this participation class (tipo de participación), e.g. 450.' },
+        limit: { type: 'number', description: 'Max rows when a range is requested (default 60, max 400).' },
+      },
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -1040,6 +1083,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       params.set('$offset', String(numOr(args.$offset, 0)));
       return getJson(`${PORTAL}/resource/${encodeURIComponent(id)}.json?${params.toString()}`);
     }
+    case 'co_fic_search':
+      return ficSearch(args);
+    case 'co_fic_unit_value':
+      return ficUnitValue(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1049,6 +1096,264 @@ async function getJson(url: string): Promise<unknown> {
   const res = await pwFetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
   if (!res.ok) throw new Error(`datos.gov.co: ${res.status} ${await res.text().then((t) => t.slice(0, 200))}`);
   return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Collective investment funds (FIC)
+// ---------------------------------------------------------------------------
+
+const FIC_VIEW = 'qhpu-8ixx';
+const FIC_SOURCE =
+  'Superintendencia Financiera de Colombia, daily collective investment fund (FIC) series, via the Colombian national open-data portal';
+// A fund counts as active if it reported within this many days of the latest published day.
+const FIC_ACTIVE_DAYS = 30;
+const FIC_LIST_TTL_MS = 6 * 3600 * 1000;
+
+interface FicFund { entity: string; fund: string; fund_code: number; last_reported: string }
+let ficListCache: { at: number; asOf: string; funds: FicFund[] } | null = null;
+
+const STOP = new Set([
+  'FONDO', 'FONDOS', 'DE', 'DEL', 'LA', 'EL', 'LOS', 'LAS', 'Y', 'E', 'INVERSION', 'INVERSIONES', 'COLECTIVA',
+  'COLECTIVAS', 'FIC', 'FI', 'SA', 'S', 'A', 'SOCIEDAD', 'FIDUCIARIA', 'FIDUCIARIO', 'ABIERTO', 'ABIERTA', 'FUND', 'THE', 'OF',
+]);
+
+function normalise(s: string): string {
+  return s.normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+function tokens(s: string, keepStop = false): string[] {
+  const all = normalise(s).split(' ').filter(Boolean);
+  const kept = all.filter((t) => !STOP.has(t));
+  return keepStop || kept.length === 0 ? all : kept;
+}
+function editLe1(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++edits > 1) return false;
+    if (a.length === b.length) { i++; j++; } else if (a.length > b.length) i++; else j++;
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
+}
+function tokenHit(q: string, c: string): number {
+  if (q === c) return 1;
+  if (q.length >= 4 && (c.startsWith(q) || q.startsWith(c) && c.length >= 4)) return 0.9;
+  if (q.length >= 5 && c.length >= 5 && editLe1(q, c)) return 0.85;
+  return 0;
+}
+/** coverage = share of the query's tokens found in the candidate; brevity breaks ties. */
+function scoreFund(qTokens: string[], f: FicFund): { coverage: number; score: number } {
+  const cTokens = tokens(`${f.entity} ${f.fund}`);
+  let found = 0;
+  let quality = 0;
+  for (const q of qTokens) {
+    let best = 0;
+    for (const c of cTokens) best = Math.max(best, tokenHit(q, c));
+    if (best > 0) found++;
+    quality += best;
+  }
+  const n = qTokens.length || 1;
+  const coverage = found / n; // 1 = every word of the query found (exactly, as a prefix, or one typo away)
+  const brevity = qTokens.length / Math.max(qTokens.length, new Set(cTokens).size);
+  return { coverage, score: coverage + 0.2 * (quality / n) + 0.1 * brevity };
+}
+
+async function loadFunds(): Promise<{ asOf: string; funds: FicFund[] }> {
+  if (ficListCache && Date.now() - ficListCache.at < FIC_LIST_TTL_MS) return ficListCache;
+  const base = `${PORTAL}/resource/${FIC_VIEW}.json`;
+  const mx = (await getJson(`${base}?${new URLSearchParams({ $select: 'max(fecha_corte) as m' })}`)) as Array<{ m?: string }>;
+  const asOf = mx[0]?.m?.slice(0, 10);
+  if (!asOf) throw new Error('Colombian FIC series: could not read the latest published date (upstream returned no rows).');
+  const since = new Date(Date.parse(asOf) - FIC_ACTIVE_DAYS * 86400000).toISOString().slice(0, 10);
+  const rows = (await getJson(
+    `${base}?${new URLSearchParams({
+      $select: 'nombre_entidad,nombre_patrimonio,codigo_negocio,max(fecha_corte) as last',
+      $where: `fecha_corte >= '${since}T00:00:00'`,
+      $group: 'nombre_entidad,nombre_patrimonio,codigo_negocio',
+      $limit: '5000',
+    })}`,
+  )) as Array<Record<string, string>>;
+  const funds = rows.map((r) => ({
+    entity: r.nombre_entidad,
+    fund: r.nombre_patrimonio,
+    fund_code: Number(r.codigo_negocio),
+    last_reported: (r.last ?? '').slice(0, 10),
+  }));
+  if (!funds.length) throw new Error('Colombian FIC series: fund list came back empty (upstream returned no rows).');
+  ficListCache = { at: Date.now(), asOf, funds };
+  return ficListCache;
+}
+
+function rank(qTokens: string[], funds: FicFund[]) {
+  return funds
+    .map((f) => ({ f, ...scoreFund(qTokens, f) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score || a.f.fund.localeCompare(b.f.fund));
+}
+
+async function ficSearch(args: Record<string, unknown>) {
+  const name = reqStr(args, 'name', '"Fiducoldex Capital Inteligente"');
+  const limit = Math.min(Math.max(numOr(args.limit, 10), 1), 25);
+  const qTokens = tokens(name);
+  if (!qTokens.length) throw new Error('Argument "name" has no usable letters or digits. Pass a fund name like "Fiducoldex Capital Inteligente".');
+  const { asOf, funds } = await loadFunds();
+  const ranked = rank(qTokens, funds);
+  const matches = ranked.filter((x) => x.coverage >= 0.99).slice(0, limit);
+  if (matches.length) {
+    return {
+      found: true,
+      query: name,
+      count: matches.length,
+      funds: matches.map((x) => ({ ...x.f, match_score: Number(x.score.toFixed(2)) })),
+      data_as_of: asOf,
+      source: FIC_SOURCE,
+    };
+  }
+  return {
+    found: false,
+    reason: 'no_fund_matches_all_words',
+    query: name,
+    searched_words: qTokens,
+    note: `No active Colombian collective investment fund matches all of those words (${funds.length} funds reported in the last ${FIC_ACTIVE_DAYS} days). Closest names are listed; this is a miss on the name, not a malformed request.`,
+    closest: ranked.slice(0, Math.min(limit, 8)).map((x) => ({ ...x.f, match_score: Number(x.score.toFixed(2)) })),
+    data_as_of: asOf,
+    source: FIC_SOURCE,
+  };
+}
+
+function isoDate(v: unknown, key: string): string | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v) || Number.isNaN(Date.parse(v))) {
+    throw new Error(`Argument "${key}" must be a date like "2026-10-22" (YYYY-MM-DD); got ${JSON.stringify(v)}.`);
+  }
+  return v;
+}
+const num = (v: unknown): number | null => {
+  const n = typeof v === 'string' || typeof v === 'number' ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+};
+
+async function ficUnitValue(args: Record<string, unknown>) {
+  const nameArg = typeof args.fund === 'string' && args.fund.trim() ? args.fund : undefined;
+  const codeArg = num(args.fund_code);
+  if (!nameArg && codeArg === null) {
+    throw new Error('Pass "fund" (a fund name like "Fiducoldex Capital Inteligente") or "fund_code" (from co_fic_search).');
+  }
+  const date = isoDate(args.date, 'date');
+  const from = isoDate(args.from, 'from');
+  const to = isoDate(args.to, 'to');
+  const cls = num(args.participation_class);
+  const { asOf, funds } = await loadFunds();
+
+  let fund: FicFund | undefined;
+  if (codeArg !== null) {
+    fund = funds.find((f) => f.fund_code === codeArg);
+    if (!fund) {
+      return { found: false, reason: 'unknown_fund_code', fund_code: codeArg, note: `No active fund has code ${codeArg}. Use co_fic_search to find it by name.`, data_as_of: asOf, source: FIC_SOURCE };
+    }
+  } else {
+    const qTokens = tokens(nameArg!);
+    if (!qTokens.length) throw new Error('Argument "fund" has no usable letters or digits.');
+    const ranked = rank(qTokens, funds);
+    const full = ranked.filter((x) => x.coverage >= 0.99);
+    if (!full.length) {
+      return {
+        found: false,
+        reason: 'no_fund_matches_all_words',
+        query: nameArg,
+        searched_words: qTokens,
+        note: `No active Colombian collective investment fund matches all of those words (${funds.length} funds reported in the last ${FIC_ACTIVE_DAYS} days). Closest names listed; this is a miss on the name, not a malformed request.`,
+        closest: ranked.slice(0, 8).map((x) => ({ ...x.f, match_score: Number(x.score.toFixed(2)) })),
+        data_as_of: asOf,
+        source: FIC_SOURCE,
+      };
+    }
+    const exact = full.filter((x) => normalise(x.f.fund) === normalise(nameArg!));
+    // A clear winner: one full match, or the best beats the runner-up by a real margin.
+    const pick = exact.length === 1 ? exact[0] : full.length === 1 || full[0].score - full[1].score >= 0.08 ? full[0] : undefined;
+    if (!pick) {
+      return {
+        found: false,
+        reason: 'ambiguous_fund_name',
+        query: nameArg,
+        note: 'More than one fund matches. Call again with fund_code (or a fuller name) for the one you want.',
+        candidates: full.slice(0, 10).map((x) => ({ ...x.f, match_score: Number(x.score.toFixed(2)) })),
+        data_as_of: asOf,
+        source: FIC_SOURCE,
+      };
+    }
+    fund = pick.f;
+  }
+
+  const range = Boolean(from || (to && !date));
+  const clauses = [`codigo_negocio = ${fund.fund_code}`];
+  if (date) clauses.push(`fecha_corte = '${date}T00:00:00'`);
+  else {
+    if (from) clauses.push(`fecha_corte >= '${from}T00:00:00'`);
+    if (to) clauses.push(`fecha_corte <= '${to}T23:59:59'`);
+    // Latest-day default: bound the scan so the large table never times out.
+    if (!from && !to) clauses.push(`fecha_corte >= '${new Date(Date.parse(fund.last_reported) - 7 * 86400000).toISOString().slice(0, 10)}T00:00:00'`);
+  }
+  if (cls !== null) clauses.push(`tipo_participacion = ${cls}`);
+  const limit = Math.min(Math.max(numOr(args.limit, 60), 1), 400);
+  const raw = (await getJson(
+    `${PORTAL}/resource/${FIC_VIEW}.json?${new URLSearchParams({
+      $where: clauses.join(' AND '),
+      $order: 'fecha_corte DESC, tipo_participacion',
+      $limit: String(range ? Math.min(limit * 2, 800) : 200),
+    })}`,
+  )) as Array<Record<string, string>>;
+
+  // Upstream repeats identical rows; keep one per day / class / compartment.
+  const seen = new Set<string>();
+  let rows = raw.filter((r) => {
+    const k = `${r.fecha_corte}|${r.tipo_participacion}|${r.principal_compartimento}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  if (!range && !date && rows.length) {
+    const latest = rows[0].fecha_corte;
+    rows = rows.filter((r) => r.fecha_corte === latest);
+  }
+  if (range) rows = rows.slice(0, limit);
+
+  if (!rows.length) {
+    return {
+      found: false,
+      reason: 'fund_matched_but_no_rows_for_request',
+      fund: fund.fund,
+      entity: fund.entity,
+      fund_code: fund.fund_code,
+      note: 'The fund exists but has no published rows for that date, range or participation class. The regulator publishes with a lag of a few days.',
+      fund_last_reported: fund.last_reported,
+      data_as_of: asOf,
+      source: FIC_SOURCE,
+    };
+  }
+  return {
+    found: true,
+    entity: fund.entity,
+    fund: fund.fund,
+    fund_code: fund.fund_code,
+    fund_last_reported: fund.last_reported,
+    row_count: rows.length,
+    rows: rows.map((r) => ({
+      date: r.fecha_corte.slice(0, 10),
+      participation_class: num(r.tipo_participacion),
+      unit_value: num(r.valor_unidad_operaciones),
+      fund_value_cop: num(r.valor_fondo_cierre_dia_t),
+      investors: num(r.numero_inversionistas),
+      return_daily_pct: num(r.rentabilidad_diaria),
+      return_monthly_pct: num(r.rentabilidad_mensual),
+      return_semester_pct: num(r.rentabilidad_semestral),
+      return_annual_pct: num(r.rentabilidad_anual),
+    })),
+    notes: 'unit_value is the price of one fund unit in COP. The four return_*_pct fields are published by the regulator as percentages but the publisher does not document their basis; the basis stated here is OUR reading, checked arithmetically against the same unit_value series, not the regulator\'s statement. Each is an effective annual rate (compounded to 365 days) computed from the unit_value change over a trailing window: daily = 1 day, monthly = 30 days, semester = 183 days, annual = 365 days. So return_daily_pct is an annualised rate, NOT the day\'s price change (the one-day change is unit_value[t]/unit_value[t-1]-1), and a semester figure above the annual one is normal. Unit values are per participation class; fee treatment follows the publisher\'s unit value.',
+    data_as_of: asOf,
+    source: FIC_SOURCE,
+  };
 }
 
 function reqStr(args: Record<string, unknown>, key: string, example: string): string {

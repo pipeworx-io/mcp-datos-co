@@ -1,16 +1,30 @@
-# mcp-datos-co
+# @pipeworx/datos-co
 
-datos.gov.co — Colombia's national open-data portal (Socrata platform).
+Colombia national open data: generic dataset search/query tools, plus a lookup for Colombian collective investment funds (fondos de inversión colectiva, FIC).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1878+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1882+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `search_datasets` | Search datasets published on Colombia's open-data portal datos.gov.co. Returns each dataset's Socrata 4x4 id (e.g. "gt2j-8ykr"), name, and description (Spanish). Use the id with dataset_columns and query_dataset. Query terms can be Spanish or English (e.g. "covid", "presupuesto", "contratos"). |
-| `dataset_columns` | List the columns of a datos.gov.co dataset: field name (used in SoQL $select/$where), human label, and data type. Call this before query_dataset so you know which fields exist. datasetId is the Socrata 4x4 code from search_datasets. |
-| `query_dataset` | Query rows from a datos.gov.co dataset using SoQL. datasetId is the Socrata 4x4 code from search_datasets. SoQL clauses: $select (columns / aggregates like "count(*)"), $where (SQL-like filter, e.g. "departamento_nom='BOGOTA' AND edad > 60"), $order ("count desc"), $group, $q (full-text across the row). Use dataset_columns first to learn field names. Returns an array of row objects keyed by field name. Default $limit is 50 (Socrata max per page is 50000). |
+- `search_datasets(q)`, `dataset_columns(datasetId)`, `query_dataset(datasetId, $where, ...)` — generic access to any dataset on the national open-data portal.
+- `co_fic_search(name)` — find a fund by name or by its management company. Case, accents and word order do not matter; one typo per word is tolerated. Returns `fund_code`, entity and fund name, or `found:false` with the closest names.
+- `co_fic_unit_value(fund | fund_code, date?, from?, to?, participation_class?)` — unit value (valor de la unidad), fund size, investors and daily/monthly/semester/annual returns per participation class. Default is the latest published day.
+
+## Behaviour worth knowing
+
+- A name that matches nothing returns `found:false` with `reason: "no_fund_matches_all_words"` and the `closest` funds. A name that matches several returns `reason: "ambiguous_fund_name"` with `candidates`; pass `fund_code` to choose. A malformed date or missing fund is an error, not a miss.
+- Publication lags a few days; `data_as_of` is the latest published day and `fund_last_reported` the fund's own last row. A requested date past that returns `fund_matched_but_no_rows_for_request`.
+- Duplicate upstream rows are collapsed to one per day and participation class.
+- Return fields: the regulator publishes percentages but does not document their basis. Our reading, verified against the same unit-value series: each is an effective annual rate (compounded to 365 days) over a trailing 1 / 30 / 183 / 365-day window, so the daily figure is annualised, not the day's price change.
+- Only funds that reported in the last 30 days are searchable.
+
+## Auth
+
+Keyless. No platform key.
+
+## Data source
+
+Superintendencia Financiera de Colombia, daily collective investment fund (FIC) series, published on the national open-data portal. Proxied per request; nothing is mirrored.
 
 ## Quick Start
 
@@ -56,7 +70,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1878+ data sources. The
+Both URLs reach the same gateway and the same 1882+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
